@@ -58,7 +58,6 @@ def get_active_groq_model(client):
     for p in preferred:
         if p in models:
             return p
-    # Fallback to any non-whisper/non-guard text model
     for m in models:
         if not any(skip in m.lower() for skip in ["whisper", "guard", "tts", "embed"]):
             return m
@@ -89,7 +88,7 @@ def parse_disruption_prompt(prompt_text, current_params, api_key):
         parsed = json.loads(resp.choices[0].message.content)
         return parsed.get("updated_params", {}), f"[{model_id}] " + parsed.get("reasoning", "Parameters updated via LLM.")
 
-    # Smart fallback parser when no API key is entered
+    # Smart fallback parser when no API key is configured
     updates = {}
     notes = []
     txt = prompt_text.lower()
@@ -108,11 +107,24 @@ def parse_disruption_prompt(prompt_text, current_params, api_key):
     if not updates:
         notes.append("Adjusted standard lead time (+1 day) to stress-test schedule.")
         updates["std_lead_time"] = min(6, current_params["std_lead_time"] + 1)
-    return updates, " ".join(notes) + " (Rule-based fallback active; add a free Groq API key in sidebar for full LLM reasoning.)"
+    return updates, " ".join(notes) + " (Rule-based fallback active; configure GROQ_API_KEY for full LLM reasoning.)"
 
 # --- Sidebar: LLM Copilot & Manual Controls ---
 st.sidebar.header("LLM Plant Operations Copilot")
-groq_key = st.sidebar.text_input("Groq API Key (Optional, Free)", type="password", placeholder="gsk_...")
+
+try:
+    default_key = st.secrets.get("GROQ_API_KEY", "")
+except Exception:
+    default_key = ""
+
+with st.sidebar.expander("LLM Engine Settings", expanded=not bool(default_key)):
+    groq_key = st.text_input(
+        "Groq API Key",
+        value=default_key,
+        type="password",
+        placeholder="gsk_...",
+        help="Pre-configured via Streamlit Secrets if hosted, or paste your own free Groq key."
+    )
 
 example_prompts = [
     "Custom scenario...",
