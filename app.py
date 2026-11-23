@@ -1,5 +1,4 @@
 import json
-import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -27,7 +26,6 @@ def load_fleet_data():
 
 df_horizon = load_fleet_data()
 
-# Initialize session state for solver parameters
 DEFAULT_PARAMS = {
     "initial_stock": 2,
     "max_techs_per_day": 2,
@@ -47,11 +45,29 @@ for k, v in DEFAULT_PARAMS.items():
 if "copilot_summary" not in st.session_state:
     st.session_state["copilot_summary"] = ""
 
-# --- LLM Scenario Parser (Groq Llama 3.3 + Deterministic Fallback) ---
+def get_active_groq_model(client):
+    """Automatically selects an active chat model available on the user's Groq account."""
+    models = [m.id for m in client.models.list().data]
+    preferred = [
+        "llama-3.1-8b-instant",
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "qwen/qwen3-32b",
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+    ]
+    for p in preferred:
+        if p in models:
+            return p
+    # Fallback to any non-whisper/non-guard text model
+    for m in models:
+        if not any(skip in m.lower() for skip in ["whisper", "guard", "tts", "embed"]):
+            return m
+    raise RuntimeError(f"No chat models found on Groq account. Available: {models}")
+
 def parse_disruption_prompt(prompt_text, current_params, api_key):
     system_instruction = (
         "You are an Industrial Operations Research Assistant. Convert the user's natural-language "
-        "disruption scenario into updated JSON solver parameters. Return ONLY valid JSON with keys: "
+        "disruption scenario into updated JSON solver parameters. Return ONLY a raw JSON object with keys: "
         "'updated_params' (subset of: initial_stock [int], max_techs_per_day [int], std_lead_time [int], "
         "exp_lead_time [int], cost_pm [float], cost_breakdown [float], cost_kit_std [float], "
         "cost_kit_exp [float]) and 'reasoning' (1-2 concise sentences explaining the parameter changes). "
@@ -60,8 +76,9 @@ def parse_disruption_prompt(prompt_text, current_params, api_key):
 
     if GROQ_AVAILABLE and api_key.strip():
         client = Groq(api_key=api_key.strip())
+        model_id = get_active_groq_model(client)
         resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=model_id,
             messages=[
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": prompt_text},
@@ -70,13 +87,13 @@ def parse_disruption_prompt(prompt_text, current_params, api_key):
             response_format={"type": "json_object"},
         )
         parsed = json.loads(resp.choices[0].message.content)
-        return parsed.get("updated_params", {}), parsed.get("reasoning", "Parameters updated via LLM.")
+        return parsed.get("updated_params", {}), f"[{model_id}] " + parsed.get("reasoning", "Parameters updated via LLM.")
 
     # Smart fallback parser when no API key is entered
     updates = {}
     notes = []
     txt = prompt_text.lower()
-    if "0 stock" in txt or "no stock" in txt or "zero stock" in txt or "stock dropped to 0" in txt:
+    if "0 stock" in txt or "no stock" in txt or "zero stock" in txt or "0 initial" in txt:
         updates["initial_stock"] = 0
         notes.append("Set initial spare-parts stock to 0.")
     if "1 tech" in txt or "one tech" in txt or "sick" in txt:
@@ -89,7 +106,7 @@ def parse_disruption_prompt(prompt_text, current_params, api_key):
         updates["cost_breakdown"] = current_params["cost_breakdown"] * 2
         notes.append("Doubled unplanned breakdown penalty.")
     if not updates:
-        notes.append("Adjusted standard lead time (+1 day) and tightened technician availability to stress-test schedule.")
+        notes.append("Adjusted standard lead time (+1 day) to stress-test schedule.")
         updates["std_lead_time"] = min(6, current_params["std_lead_time"] + 1)
     return updates, " ".join(notes) + " (Rule-based fallback active; add a free Groq API key in sidebar for full LLM reasoning.)"
 
@@ -249,4 +266,3 @@ else:
         st.subheader("Fleet Risk & Maintenance Schedule")
         sdf = result["sched_df"].sort_values("14-Day Failure Risk", ascending=False)
         st.dataframe(sdf[["Engine ID", "14-Day Failure Risk", "Scheduled PM Day"]], use_container_width=True, height=400)
-    
