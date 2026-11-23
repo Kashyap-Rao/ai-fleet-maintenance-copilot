@@ -1,115 +1,29 @@
-import json
 import streamlit as st
-import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
-from ortools.linear_solver import pywraplp
-
-try:
-    from groq import Groq
-    GROQ_AVAILABLE = True
-except ImportError:
-    GROQ_AVAILABLE = False
+from database import load_fleet_horizon
+from optimizer import DEFAULT_PARAMS, solve_joint_milp
+from llm_copilot import parse_disruption_prompt, generate_executive_debrief
 
 st.set_page_config(page_title="AI Fleet Maintenance & Spare-Parts Copilot", layout="wide")
 
 st.title("AI-Driven Fleet Maintenance & Spare-Parts Optimization Copilot")
 st.markdown(
     "**Joint Predictive Maintenance + Supply Chain MILP + LLM Operations Copilot:** "
-    "Combines **LightGBM RUL & Failure Hazard Models** (NASA C-MAPSS) with **Google OR-Tools** "
-    "to co-optimize preventative maintenance schedules and spare-parts freight under technician and lead-time constraints."
+    "Co-optimizes preventative maintenance schedules and spare-parts freight under technician "
+    "and multi-day lead-time constraints."
 )
 
-@st.cache_data
-def load_fleet_data():
-    return pd.read_csv("fleet_hazard_predictions.csv")
-
-df_horizon = load_fleet_data()
-
-DEFAULT_PARAMS = {
-    "initial_stock": 2,
-    "max_techs_per_day": 2,
-    "std_lead_time": 3,
-    "exp_lead_time": 1,
-    "cost_pm": 2500.0,
-    "cost_breakdown": 18000.0,
-    "cost_kit_std": 1200.0,
-    "cost_kit_exp": 2400.0,
-    "cost_holding": 80.0,
-}
+df_horizon, data_source = load_fleet_horizon()
+st.caption(f"Active Telemetry Source: **{data_source}** | Fleet Size: **20 Turbofan Engines** | Horizon: **14 Days**")
 
 for k, v in DEFAULT_PARAMS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-if "copilot_summary" not in st.session_state:
-    st.session_state["copilot_summary"] = ""
+if "copilot_debrief" not in st.session_state:
+    st.session_state["copilot_debrief"] = ""
 
-def get_active_groq_model(client):
-    """Automatically selects an active chat model available on the user's Groq account."""
-    models = [m.id for m in client.models.list().data]
-    preferred = [
-        "llama-3.1-8b-instant",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "qwen/qwen3-32b",
-        "openai/gpt-oss-20b",
-        "openai/gpt-oss-120b",
-    ]
-    for p in preferred:
-        if p in models:
-            return p
-    for m in models:
-        if not any(skip in m.lower() for skip in ["whisper", "guard", "tts", "embed"]):
-            return m
-    raise RuntimeError(f"No chat models found on Groq account. Available: {models}")
-
-def parse_disruption_prompt(prompt_text, current_params, api_key):
-    system_instruction = (
-        "You are an Industrial Operations Research Assistant. Convert the user's natural-language "
-        "disruption scenario into updated JSON solver parameters. Return ONLY a raw JSON object with keys: "
-        "'updated_params' (subset of: initial_stock [int], max_techs_per_day [int], std_lead_time [int], "
-        "exp_lead_time [int], cost_pm [float], cost_breakdown [float], cost_kit_std [float], "
-        "cost_kit_exp [float]) and 'reasoning' (1-2 concise sentences explaining the parameter changes). "
-        f"Current parameters: {json.dumps(current_params)}"
-    )
-
-    if GROQ_AVAILABLE and api_key.strip():
-        client = Groq(api_key=api_key.strip())
-        model_id = get_active_groq_model(client)
-        resp = client.chat.completions.create(
-            model=model_id,
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": prompt_text},
-            ],
-            temperature=0.1,
-            response_format={"type": "json_object"},
-        )
-        parsed = json.loads(resp.choices[0].message.content)
-        return parsed.get("updated_params", {}), f"[{model_id}] " + parsed.get("reasoning", "Parameters updated via LLM.")
-
-    # Smart fallback parser when no API key is configured
-    updates = {}
-    notes = []
-    txt = prompt_text.lower()
-    if "0 stock" in txt or "no stock" in txt or "zero stock" in txt or "0 initial" in txt:
-        updates["initial_stock"] = 0
-        notes.append("Set initial spare-parts stock to 0.")
-    if "1 tech" in txt or "one tech" in txt or "sick" in txt:
-        updates["max_techs_per_day"] = 1
-        notes.append("Reduced daily technician capacity to 1.")
-    if "delay" in txt or "customs" in txt or "5 day" in txt:
-        updates["std_lead_time"] = 5
-        notes.append("Increased standard freight lead time to 5 days.")
-    if "double" in txt and ("breakdown" in txt or "downtime" in txt or "penalty" in txt):
-        updates["cost_breakdown"] = current_params["cost_breakdown"] * 2
-        notes.append("Doubled unplanned breakdown penalty.")
-    if not updates:
-        notes.append("Adjusted standard lead time (+1 day) to stress-test schedule.")
-        updates["std_lead_time"] = min(6, current_params["std_lead_time"] + 1)
-    return updates, " ".join(notes) + " (Rule-based fallback active; configure GROQ_API_KEY for full LLM reasoning.)"
-
-# --- Sidebar: LLM Copilot & Manual Controls ---
+# --- Sidebar: LLM Copilot ---
 st.sidebar.header("LLM Plant Operations Copilot")
 
 try:
@@ -118,48 +32,46 @@ except Exception:
     default_key = ""
 
 with st.sidebar.expander("LLM Engine Settings", expanded=not bool(default_key)):
-    groq_key = st.text_input(
-        "Groq API Key",
-        value=default_key,
-        type="password",
-        placeholder="gsk_...",
-        help="Pre-configured via Streamlit Secrets if hosted, or paste your own free Groq key."
-    )
+    groq_key = st.text_input("Groq API Key", value=default_key, type="password", placeholder="gsk_...")
 
 example_prompts = [
     "Custom scenario...",
     "Warehouse audit found 0 initial kits in stock, and customs delayed standard shipping to 5 days.",
     "One technician is out sick (max 1/day) and emergency breakdown penalties doubled to $36,000.",
-    "Expedited air freight price spiked to $4,500 per kit due to fuel surcharges."
+    "Expedited air freight price spiked to $4,500 per kit due to fuel surcharges.",
 ]
 preset = st.sidebar.selectbox("Quick Disruption Presets", example_prompts)
 user_prompt = st.sidebar.text_area(
     "Describe an operational disruption:",
     value="" if preset == "Custom scenario..." else preset,
     height=85,
-    placeholder="e.g., Standard shipping delayed to 5 days and only 1 technician available..."
+    placeholder="e.g., Standard shipping delayed to 5 days and only 1 technician available...",
 )
 
 col_btn1, col_btn2 = st.sidebar.columns(2)
 if col_btn1.button("Apply Scenario", type="primary"):
     if user_prompt.strip():
         try:
-            new_vals, reason = parse_disruption_prompt(user_prompt, {k: st.session_state[k] for k in DEFAULT_PARAMS}, groq_key)
-            for k, v in new_vals.items():
-                if k in st.session_state:
-                    st.session_state[k] = type(DEFAULT_PARAMS[k])(v)
-            st.session_state["copilot_summary"] = reason
+            current_p = {k: st.session_state[k] for k in DEFAULT_PARAMS}
+            before_res = solve_joint_milp(df_horizon, current_p)
+            new_p, param_note = parse_disruption_prompt(user_prompt, current_p, groq_key)
+            for k, v in new_p.items():
+                st.session_state[k] = v
+            after_res = solve_joint_milp(df_horizon, new_p)
+            debrief = generate_executive_debrief(user_prompt, before_res, after_res, groq_key)
+            st.session_state["copilot_debrief"] = f"**Parameter Adjustment:** {param_note}\n\n**Executive Debrief:** {debrief}"
         except Exception as e:
-            st.sidebar.error(f"Parser error: {e}")
+            st.sidebar.error(f"Copilot error: {e}")
 
 if col_btn2.button("Reset Defaults"):
     for k, v in DEFAULT_PARAMS.items():
         st.session_state[k] = v
-    st.session_state["copilot_summary"] = ""
+    st.session_state["copilot_debrief"] = ""
 
-if st.session_state["copilot_summary"]:
-    st.info(f"**Copilot Update:** {st.session_state['copilot_summary']}")
+if st.session_state["copilot_debrief"]:
+    st.info(st.session_state["copilot_debrief"])
 
+# --- Sidebar: Manual Parameter Sliders ---
 st.sidebar.markdown("---")
 st.sidebar.subheader("Solver Constraints & Cost Parameters")
 st.session_state["initial_stock"] = st.sidebar.slider("Initial Spare Kits in Warehouse", 0, 10, int(st.session_state["initial_stock"]))
@@ -168,100 +80,19 @@ st.session_state["std_lead_time"] = st.sidebar.slider("Standard Freight Lead Tim
 st.session_state["cost_breakdown"] = st.sidebar.number_input("Unplanned Breakdown Penalty ($)", value=float(st.session_state["cost_breakdown"]), step=2000.0)
 st.session_state["cost_kit_exp"] = st.sidebar.number_input("Expedited Air Kit Cost ($)", value=float(st.session_state["cost_kit_exp"]), step=200.0)
 
-# --- Joint MILP Solver ---
-def solve_joint_milp(df_h, p):
-    solver = pywraplp.Solver.CreateSolver("SCIP")
-    engines = sorted(df_h["engine_name"].unique())
-    days = sorted(df_h["day"].unique())
-    M, T = len(engines), len(days)
-
-    prob_matrix = df_h.pivot(index="engine_name", columns="day", values="cum_fail_prob").loc[engines, days].values
-
-    x = [[solver.IntVar(0, 1, f"x_{m}_{t}") for t in range(T)] for m in range(M)]
-    q_std = [solver.IntVar(0, 20, f"q_std_{t}") for t in range(T)]
-    q_exp = [solver.IntVar(0, 20, f"q_exp_{t}") for t in range(T)]
-    inv = [solver.NumVar(0, 50, f"inv_{t}") for t in range(T)]
-
-    for m in range(M):
-        solver.Add(sum(x[m][t] for t in range(T)) <= 1)
-
-    for t in range(T):
-        solver.Add(sum(x[m][t] for m in range(M)) <= p["max_techs_per_day"])
-        prev_inv = p["initial_stock"] if t == 0 else inv[t - 1]
-        arr_std = q_std[t - p["std_lead_time"]] if t >= p["std_lead_time"] else 0
-        arr_exp = q_exp[t - p["exp_lead_time"]] if t >= p["exp_lead_time"] else 0
-        solver.Add(inv[t] == prev_inv + arr_std + arr_exp - sum(x[m][t] for m in range(M)))
-
-    obj = solver.Objective()
-    for t in range(T):
-        obj.SetCoefficient(q_std[t], float(p["cost_kit_std"]))
-        obj.SetCoefficient(q_exp[t], float(p["cost_kit_exp"]))
-        obj.SetCoefficient(inv[t], float(p["cost_holding"]))
-
-    for m in range(M):
-        horizon_risk = float(prob_matrix[m, -1]) * p["cost_breakdown"]
-        for t in range(T):
-            risk_before = float(prob_matrix[m, t - 1]) * p["cost_breakdown"] if t > 0 else 0.0
-            obj.SetCoefficient(x[m][t], float(p["cost_pm"] + risk_before - horizon_risk))
-
-    offset = sum(float(prob_matrix[m, -1]) * p["cost_breakdown"] for m in range(M))
-    obj.SetMinimization()
-
-    status = solver.Solve()
-    if status != pywraplp.Solver.OPTIMAL:
-        return None
-
-    opt_cost = obj.Value() + offset
-
-    sched_rows = []
-    for m, eng in enumerate(engines):
-        s_days = [days[t] for t in range(T) if x[m][t].solution_value() > 0.5]
-        sched_rows.append({
-            "Engine ID": eng,
-            "14-Day Failure Risk": round(float(prob_matrix[m, -1]), 3),
-            "Scheduled PM Day": f"Day {s_days[0]}" if s_days else "No PM Needed",
-            "day_num": s_days[0] if s_days else None
-        })
-
-    parts_rows = []
-    for t, d in enumerate(days):
-        parts_rows.append({
-            "Day": d,
-            "Engines Serviced": int(sum(x[m][t].solution_value() for m in range(M))),
-            "Standard Orders (Kits)": int(round(q_std[t].solution_value())),
-            "Expedited Orders (Kits)": int(round(q_exp[t].solution_value())),
-            "End-of-Day Warehouse Stock": round(inv[t].solution_value(), 1)
-        })
-
-    reactive_cost = 0.0
-    for m in range(M):
-        hi = np.where(prob_matrix[m] >= 0.65)[0]
-        if len(hi) > 0:
-            trig = min(T - 1, hi[0] + p["exp_lead_time"])
-            reactive_cost += prob_matrix[m, trig] * p["cost_breakdown"] + p["cost_pm"] + p["cost_kit_exp"]
-        else:
-            reactive_cost += prob_matrix[m, -1] * p["cost_breakdown"]
-
-    return {
-        "opt_cost": opt_cost,
-        "reactive_cost": reactive_cost,
-        "savings": reactive_cost - opt_cost,
-        "sched_df": pd.DataFrame(sched_rows),
-        "parts_df": pd.DataFrame(parts_rows)
-    }
-
+# --- Solve & Render Dashboard ---
 result = solve_joint_milp(df_horizon, {k: st.session_state[k] for k in DEFAULT_PARAMS})
 
 if result is None:
-    st.error("Infeasible constraints! Try increasing technician capacity or initial spare kits.")
+    st.error("Infeasible constraints! Increase technician capacity or initial spare kits in the sidebar.")
 else:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Joint ML-MILP Total Cost", f"${result['opt_cost']:,.0f}")
     c2.metric("Reactive Baseline Cost", f"${result['reactive_cost']:,.0f}")
     c3.metric("14-Day Net Savings", f"${result['savings']:,.0f}", f"{(result['savings']/result['reactive_cost'])*100:.1f}%")
-    c4.metric("Expedited Kits Ordered", int(result["parts_df"]["Expedited Orders (Kits)"].sum()))
+    c4.metric("Expedited Kits Ordered", result["expedited_kits"])
 
-    col_left, col_right = st.columns([1.2, 1])
+    col_left, col_right = st.columns([1.25, 1])
 
     with col_left:
         st.subheader("14-Day Spare-Parts Ordering & Warehouse Inventory")
@@ -271,10 +102,21 @@ else:
         fig.add_trace(go.Bar(name="Expedited Air Orders", x=pdf["Day"], y=pdf["Expedited Orders (Kits)"], marker_color="#e15759"))
         fig.add_trace(go.Scatter(name="Warehouse Stock (End of Day)", x=pdf["Day"], y=pdf["End-of-Day Warehouse Stock"], mode="lines+markers", line=dict(color="#59a14f", width=3)))
         fig.add_trace(go.Scatter(name="Engines Serviced", x=pdf["Day"], y=pdf["Engines Serviced"], mode="markers", marker=dict(color="#111111", size=10, symbol="diamond")))
-        fig.update_layout(barmode="stack", xaxis_title="Planning Day (1–14)", yaxis_title="Kits / Engines", height=400)
+        fig.update_layout(barmode="stack", xaxis_title="Planning Day (1–14)", yaxis_title="Kits / Engines", height=390)
         st.plotly_chart(fig, use_container_width=True)
 
     with col_right:
         st.subheader("Fleet Risk & Maintenance Schedule")
         sdf = result["sched_df"].sort_values("14-Day Failure Risk", ascending=False)
-        st.dataframe(sdf[["Engine ID", "14-Day Failure Risk", "Scheduled PM Day"]], use_container_width=True, height=400)
+        st.dataframe(sdf[["Engine ID", "14-Day Failure Risk", "Scheduled PM Day"]], use_container_width=True, height=390)
+
+    # --- Practical ERP Action Export ---
+    st.subheader("ERP / SAP Dispatch & Purchase Order Plan")
+    st.dataframe(result["parts_df"], use_container_width=True)
+    csv_export = result["parts_df"].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download 14-Day Dispatch & Procurement Schedule (CSV)",
+        data=csv_export,
+        file_name="14day_maintenance_and_po_plan.csv",
+        mime="text/csv",
+    )
