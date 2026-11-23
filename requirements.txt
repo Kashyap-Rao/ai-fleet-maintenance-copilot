@@ -1,0 +1,6 @@
+pandas
+numpy
+ortools
+streamlit
+plotly
+groq
